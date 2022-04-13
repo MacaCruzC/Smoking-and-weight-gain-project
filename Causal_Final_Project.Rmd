@@ -1,0 +1,558 @@
+---
+title: "Smoking and weight gain project"
+output: html_notebook
+---
+
+```{r results='hide'}
+#install.packages('lemon')
+#install.packages('tableone')
+#install.packages('ggExtra')
+#install.packages('Hmisc')
+#install.packages("Boruta")
+#install.packages("Matching")
+library(readr)
+library(kableExtra)
+library(lemon)
+library(tidyverse)
+library(dplyr)
+library(tableone)
+library(broom)
+library(ggplot2)
+library(ggExtra)
+library(glmnet)
+library(psych)
+library(Hmisc)
+library(randomForest)
+library(datasets)
+library(Boruta)
+library(Matching)
+library(rgenoud)
+knit_print.data.frame <- lemon_print
+```
+
+# Objective
+
+The objective of this analysis is to answer the following causal question ***"what is the average causal effect of smoking cessation on body weight gain?"*** In other words words we want to estimate average causal effect of smoking cessation on weight gain. In order to perform this study, we will use the data from National Health and Nutrition Examination Survey Data I Epidemiological Follow-up Study (NHEFS), where individuals had an initial visit and then a follow-up after 10 years. Those individuals were classified as a 1's if they had reported to quit smoking before the follow-up visit and 0's otherwise.
+
+Before performing the objective, one should notice that there are empirical evidences that will make a patient that quit smoking to gain weight. In particular, the nicotine in cigarettes speeds up our metabolism. Furthermore, smoking per se decreases your will to eat. Finally, smoking is a routine, which means that quiting it may result into you trying to replace that routing for some others, as can be eating snacks or non-healthy food.
+
+# Data Set
+
+The NHANES I Epidemiologic Follow-up Study (NHEFS) is a national study designed to examine the relationships between clinical, nutritional, and behavioral factors assessed and succeeding morbidity, mortality, hospital utilization, and changes in risk factors, functional limitation, and institutionalization. The NHEFS cohort includes all persons 25-74 years of age who completed a medical examination at NHANES I in 1971-75. Individuals in the dataset had a baseline visits and a follow-up visit about 10 years later
+
+We start by loading and analyzing the data
+
+```{r results='hide'}
+
+nhefs_codebook <- read_csv("nhefs_codebook.csv") 
+nhefs_complete <- read_csv("nhefs_complete.csv")
+nhefs_col = ncol(nhefs_complete)
+nhefs_rows = nrow(nhefs_complete)
+```
+
+The total data set is comprised by `r nhefs_col` columns and `r nhefs_rows` rows. Patients are identified by a unique personal identifier, denoted seqn in the dataframe. Each patient has a total of `r nhefs_col-1` observations containing patients medical and economic information like alcohol consumption, total income, etc. The total extent of variables and their descriptions can be found on the nhefs_codebook dataframe.
+
+```{r caption='Sample of dataframe containing variables and variables descriptions' ,render=lemon_print}
+head(nhefs_codebook)%>%kbl() %>% kable_styling()
+```
+
+## Data preprocessing and cleaning
+
+In order to be able to perform this study, we must first go through the data we have, apply the necessary preprocessing steps for it to be complete and visually explore its values, so that we can haver a better understanding in order to better interpret them.
+
+### All zero columns
+
+To begin with, we will get rid of the columns that only contain 0s, since these ones would not let us scale our data; when dividing 0 by 0, the indetermined value of this division would result in an error. Therefore, we get rid of them, since normalizing the data is always a very important procedure to perform, since it will better tell the machine how to understand the implications of each numerical value.
+
+```{r}
+nhefs_complete <- nhefs_complete[, colSums(nhefs_complete != 0) > 0]
+```
+
+### Missing values
+
+Now, we will impute the empty values contained in any of the columns by replacing them for some value related to the column they belong to. For the purpose of this project, we have chosen this related value to be the median value of each column, among all possibilities, such as the mean, the mode, etc. In further improvements of this project, we would try several options for this imputation technique and use the one that better suited our model and results. The dataset contains a total of `r sum(is.na(nhefs_complete))` missing values that represents `r round(mean(is.na(nhefs_complete))*100,3)`% of the total observations. We start by identifying the columns that contain this missing values and then, with the custom-made code, we get rid of them and check that, indeed, we have imputed the empty values.
+
+```{r}
+# getting median of each column using apply() 
+all_column_median <- apply(nhefs_complete, 2, median, na.rm=TRUE)
+  
+# imputing median value with NA 
+for(i in colnames(nhefs_complete))
+  nhefs_complete[,i][is.na(nhefs_complete[,i])] <- all_column_median[i]
+
+missing_cols <- names(which(colSums(is.na(nhefs_complete))>0))
+missing_cols
+```
+
+### Data Engineering
+
+```{r}
+education = nhefs_complete$school
+hist(education)
+
+```
+
+```{r}
+nhefs_complete = nhefs_complete %>% mutate(level_education = case_when(school < 9 ~1, school < 12 ~2, school == 12 ~3, school < 16 ~ 5, TRUE ~5))
+
+counts = table(nhefs_complete$level_education)
+barplot(counts,main='Patients that quit smoking between first and second questionnaire')
+
+
+```
+
+Active is composed by 3 unique values: `r unique(nhefs_complete$active)`\`were 0 is assigned to active people, 1 to moderatly active and 2 to very active. For the purpose of our analysis we are only interested in active v.s. inactive. Hence we will remap this results into these two categories
+
+```{r}
+nhefs_complete = nhefs_complete %>% mutate(active = case_when(active == 2 ~ 0, active ==1 ~ 0, TRUE ~1))
+counts = table(nhefs_complete$active)
+barplot(counts,main='Patients that quit smoking between first and second questionnaire')
+
+
+```
+
+```{r}
+cigs <- nhefs_complete$smokeintensity
+hist(cigs)
+
+```
+
+```{r}
+nhefs_complete = nhefs_complete %>% mutate(heavy_smoker = case_when(smokeintensity > 20 ~ 1, TRUE ~0))
+counts = table(nhefs_complete$heavy_smoker)
+barplot(counts,main='Patients that quit smoking between first and second questionnaire')
+
+```
+
+# Analysis
+
+## Baseline Characteristics
+
+Our first variable of interest is "*qsmk*", this is in terms of causal inference *the treatment*. The column is constructed in the following manner: 1 is assigned to the patient if they quit smoking between 1st questionnaire and 1982, 0 if the patient kept on smoking.
+
+```{r}
+counts = table(nhefs_complete$qsmk)
+barplot(counts,main='Patients that quit smoking between first and second questionnaire', names.arg=c("Quit Smoking","Kept on Smoking"))
+
+```
+
+Our second variable of interest is the weight gain "wt82_71" or in other words *the outcome*. Each individuals´s weight gain was measured in kg as the body weight at the follow-up visit minus the body weight at the baseline visit.
+
+```{r}
+weight_gain = nhefs_complete$wt82_71
+hist(weight_gain,
+     main = 'Weight gain in patients between first questionnaire and the follow-up visit',
+     xlab = 'Weight gain in kg')
+```
+
+By limiting our data to complete cases on the variables that we will analyse then no further cleaning is needed.
+
+```{r}
+nhefs_complete %>%
+  #  only show for pts not lost to follow-up
+  filter(censored == 0) %>% 
+  group_by(qsmk) %>% 
+  summarise(
+    mean_weight_change = mean(wt82_71), 
+    sd = sd(wt82_71)) %>%kbl() %>% kable_styling()
+
+```
+
+```{r}
+lmweightgain = lm(wt82_71~qsmk, data = nhefs_complete)
+summary(lmweightgain)
+```
+
+```{r}
+olsci = confint.lm(lmweightgain)
+olsci%>%kbl() %>% kable_styling()
+
+```
+
+```{r}
+plot(lmweightgain$residuals, pch = 16, col = "red")
+
+```
+
+## Confounding Variables
+
+### Naive approach to confounding variables
+
+We have seen that may exist some variables that confound the model, i.e making use of this variables for performing regressions will decrease our performance significantly. Hence, one would like to get rid off this type of variables before performing this regressions. However, this is not a trivial process and needs an analytical study. In order to do so, we will plot different variables that we consider confounding for the sake of the study and see how they distribute between the two groups of the study. The results are shown in the back-to-back plots below. Therefore, we will be able to compare the distributions for both classes and see if they are distinct.
+
+We have chosen to display two opposite examples. One for a covariate that is significant to our model and one that is not. For the first one, which in this case is the age, we can see a different distribution of values depending on whether the patient quit smoking. Then, for the second one corresponding to the income, we can see almost symmetric distributions. In other words, non-symmetric distributions tell us that the corresponding variable has different values for the outcome of interest and is therefore relevant, while symmetric ones do not help our model. Hence, in the two plots below, we can see both examples.
+
+```{r}
+ggplot() +
+  geom_histogram(data = nhefs_complete %>% filter(qsmk == 0),
+                 aes(y = -(..density..), x = age, fill = qsmk),
+                 col = "black", binwidth = 1) +
+  geom_histogram(data = nhefs_complete %>% filter(qsmk == 1),
+                 aes(y = ..density.., x = age, fill = qsmk),
+                 col = "black", binwidth = 1) +
+  labs(x = "Age", y = "Density of patients") +
+  theme_bw() + theme(legend.position = "none")
+```
+
+```{r}
+ggplot() +
+  geom_histogram(data = nhefs_complete %>% filter(qsmk == 0),
+                 aes(y = -(..density..), x = income, fill = qsmk),
+                 col = "black", binwidth = 0.5) +
+  geom_histogram(data = nhefs_complete %>% filter(qsmk == 1),
+                 aes(y = ..density.., x = income, fill = qsmk),
+                 col = "black", binwidth = 0.5) +
+  labs(x = "R Ratio", y = "Number of proteins") +
+  theme_bw() + theme(legend.position = "none")
+
+```
+
+Now, once we have given one example of each, we will just use the ones with non-symmetric distributions, corresponding to the relevant covariates for our model, which we later be explained.
+
+We continue by displaying a table with the distribution of the values for each covariate in our data, in order to see how balance or unbalanced they are with respect to the treatment variable (in our case, quitting smoking or not).
+
+```{r}
+
+fct_yesno <- function(x) {
+  factor(x, labels = c("No", "Yes"))
+}
+tbl1_data <- nhefs_complete%>% 
+  #  filter out participants lost to follow-up 
+  #  turn categorical variables into factors
+  mutate(
+    university = fct_yesno(ifelse(education == 5, 1, 0)),
+    no_exercise = fct_yesno(ifelse(exercise == 2, 1, 0)),
+    inactive = fct_yesno(ifelse(active == 0, 1, 0)),
+    qsmk = factor(qsmk, levels = 1:0, c("Ceased Smoking", "Continued Smoking")),
+    sex = factor(sex, levels = 1:0, labels = c("Female", "Male")),
+    race = factor(race, levels = 1:0, labels = c("Other", "White")),
+    asthma = factor(asthma, levels = 1:0, labels = c("Yes", "No")),
+    heavy_smoker = fct_yesno(ifelse(heavy_smoker == 1, 1, 0))
+  ) %>% 
+  #  only include a subset of variables in the descriptive tbl
+  select(qsmk, age, sex, race, university, wt71, smokeintensity, smokeyrs, no_exercise, inactive,asthma, heavy_smoker) %>% 
+  #  rename variable names to match Table 12.1
+  rename(
+    "Smoking Cessation" = "qsmk",
+    "Age" = "age",
+    "Sex" = "sex",
+    "Race" = "race",
+    "University education" = "university",
+    "Weight, kg" = "wt71", 
+    "Cigarettes/day" = "smokeintensity",
+    "Years smoking" = "smokeyrs",
+    "Little or no exercise" = "no_exercise",
+    "Inactive daily life" = "inactive",
+    "Asthma" = "asthma",
+    "Heavy Smoker (more than 20 Cigarettes a day)" = 'heavy_smoker'
+  )
+tbl1_data %>% 
+  #  create a descriptive table
+  CreateTableOne(
+    #  pull all variable names but smoking
+    vars = select(tbl1_data, -`Smoking Cessation`) %>% names, 
+    #  stratify by smoking status
+    strata = "Smoking Cessation", 
+    #  use `.` to direct the pipe to the `data` argument
+    data = ., 
+    #  don't show p-values
+    test = FALSE
+  ) %>% kableone()
+```
+
+#### Logistic Regression with Naive Confounders
+
+Here, we perform our first approach and select those that do have significant coefficients, which will be the ones with a non-symmetric distribution of values for each outcome class, as we have already seen before in this section. Therefore, below we display the results obtained for this approach.
+
+```{r}
+lognaive <- glm(
+  qsmk ~  age + sex + race + education + smokeintensity + smokeyrs + exercise  + asthma  + heavy_smoker, 
+  family = binomial(), 
+  data = nhefs_complete
+)
+
+summary(lognaive)
+
+```
+
+We can see that all covariates have significant coefficients, therefore reflecting their relevance on the model.
+
+### Confounder Selection via Penalized Regression
+
+Now, we will introduce several different approaches for variable selection that include using some of the penalization methods. In our case, we will focus on LASSO and Ridge.
+
+#### LASSO
+
+Note that the initial dataset has a very large number of variables; hence, many of them may lead us into errors when trying to make estimations and predictions over our data. In order to get rid off this useless variables, one can make us of different methods. For our case of study we will make use of Penalized likelihood methods, in particular LASSO and Random Forest for model selection.
+
+Firstly, we ran LASSO over the whole dataset, the result is in form of coefficients that indicate how relevant is a variable for regressing the main objective of the problem. Therefore, those variables that are irrelevant get a 0 coefficient that indicates that this variable will not be significant for our target variable.
+
+$\text{arg min} -log p(y|\theta) + \lambda |\beta|$
+
+Note that \$\\lambda\$ is a parameter of our model that has to be estimated, in order to do so, we will use the BIC criterion as an approximation to finding the model with the highest integrated likelihood in a Bayesian setting.
+
+$−2 log p(y | \theta) + log(n)|\beta|_0$
+
+The results of running this method can be found below:
+
+```{r}
+y = nhefs_complete$qsmk
+X = subset(nhefs_complete, select = -c(wt82_71,qsmk,wt71, wt82,death,yrdth,modth,dadth,seqn) )
+fit.lasso= cv.glmnet(x=scale(as.matrix(X)), y=y, nfolds=10, family = "binomial")
+fit.lasso
+```
+
+```{r}
+coef_lassocv <- as.vector(coef(fit.lasso, s='lambda.min'))
+names(coef_lassocv) <- c('intercept', colnames(X))
+lassocv_vars = length(coef_lassocv[coef_lassocv!=0])
+seleted_var<-names(coef_lassocv[coef_lassocv!=0])
+lassocv_vars
+seleted_var
+```
+
+As we can see, Lasso selects 42 covariates, which are the ones that can be seen in the results above. Now, with these covariates, we will again perform a logistic regression and see which of them have relevance to our model by means of having significant coefficients.
+
+##### Logistic Regression with Confounders selected via LASSO
+
+```{r}
+seleted_var <- seleted_var[-1]
+X_train = scale(subset(nhefs_complete, select = c(seleted_var) ))
+y = nhefs_complete$qsmk
+data = data.frame(cbind(y,X_train))
+logpropensity<- glm(y ~ ., family = binomial(), data = data)
+summary(logpropensity)
+
+```
+
+As we can see, only 2 out of the 42 selected variables by LASSO have relevant coefficients. In other words, this model is telling us that there is no point in working with the rest of 40 variables.
+
+#### Ridge Regression
+
+Another Penalized Likelihood method that it is commonly used for model selection is the Ridge Regression, which consists in minimizing the expression below:
+
+$\text{arg min} -log p(y|\theta) + \lambda ||\beta||^2$
+
+```{r}
+fit.ridge= cv.glmnet(x=as.matrix(X), y=y, alpha = 0, nfolds=10)
+fit.ridge
+b.rigde <- as.vector(coef(fit.ridge, s='lambda.min'))
+names(b.rigde) <- c('intercept',colnames(X))
+length(b.rigde[b.rigde!=0])
+
+```
+
+##### Logistic Regression with Confounders selected via Ridge
+
+In the results below we can see that Ridge is selecting 59 variables. Then, we can test the performance of our logistic regression with these 59 covariates.
+
+```{r}
+coef_ridge <- as.vector(coef(fit.ridge, s='lambda.min'))
+names(coef_ridge) <- c('intercept', colnames(X))
+ridgecv_vars = length(coef_ridge[coef_ridge!=0])
+seleted_var_r<-names(coef_ridge[coef_ridge!=0])
+ridgecv_vars
+seleted_var_r
+
+```
+
+```{r}
+seleted_var_r <- seleted_var_r[-1]
+X_train = subset(nhefs_complete, select = c(seleted_var_r) )
+y = nhefs_complete$qsmk
+logpropensityR<- glm(y ~ ., family = binomial(), data = cbind(y, X_train))
+summary(logpropensityR)
+
+```
+
+The results provided by Ridge are even more meaningless than the ones provided by LASSO, since none of the covariates selected here are considered significant for our model.
+
+#### LASSO BIC
+
+```{r}
+lasso.bic <- function(y,x,extended=FALSE) {
+  #Select model in LASSO path with best BIC (using LASSO regression estimates)
+  #Input
+  # - y: vector with response variable
+  # - x: design matrix
+  # - extended: whether to use EBIC (Chen and Chen 2008) instead of BIC
+  #
+  #Output: list with the following elements
+  # - coef: LASSO-estimated regression coefficient with lambda set via BIC
+  # - ypred: predicted y
+  # - lambda.opt: optimal value of lambda
+  # - lambda: data.frame with bic and number of selected variables for each value of lambda
+  require(glmnet)
+  fit <- glmnet(x=x,y=y,family='binomial',alpha=1)
+  pred <- cbind(1,x) %*% rbind(fit$a0,fit$beta)
+  n <- length(y)
+  p <- colSums(fit$beta!=0) + 1
+  if (!extended){
+    bic <- n * log(colSums((y-pred)^2)/length(y)) + n*(log(2*pi)+1) + log(n)*p 
+  } else {
+    bic <- n * log(colSums((y-pred)^2)/length(y)) + n*(log(2*pi)+1) + log(n)*p + 2*log(choose(ncol(x),p))
+  }
+  sel <- which.min(bic)
+  beta <- c(fit$a0[sel],fit$beta[,sel]); names(beta)[1]= 'Intercept'
+  ypred <- pred[,sel]
+  ans <- list(coef=beta,ypred=ypred,lambda.opt=fit$lambda[sel],lambda=data.frame(lambda=fit$lambda,bic=bic,nvars=p))
+  return(ans)
+}
+
+
+y = nhefs_complete$qsmk
+X = subset(nhefs_complete, select = -c(wt82_71,qsmk,wt71, wt82,death,yrdth,modth,dadth,seqn) )
+
+
+fit.lassobic= lasso.bic(y=y,x=as.matrix(X),extended = TRUE)
+coef_lassobic <- fit.lassobic$coef
+
+
+names(coef_lassobic) <- c('intercept', colnames(X))
+lassobic_vars = length(coef_lassobic[coef_lassobic!=0])
+
+lassobic_vars
+names(coef_lassobic[coef_lassobic!=0])
+```
+
+As we can see here, this model is just selecting 2 covariates. Therefore, we will not bother to run the logistic regression in this case, since it has too many few variables to be considered accurate or understandable.
+
+#### Random Forest Variable Selection
+
+Apart from using the previous penalization methods for variable or model selection, we have made use of Random Forests in order to find those variables that are truly relevant to our model. Random forests are generally made of hundreds of decision trees, each of them containing random observations from the original dataset and a random set of variables. As not every tree sees all the features nor all the observations, it is guaranteed that the trees are not correlated. At each node of the tree the dataset is divided into two containers, each of them containing observations that are similar among themselves and very different from the ones in the opposite bucket. Therefore, the importance of each feature will be derived from how "pure" each of this buckets is. Note that a node is 100% impure when a this buckets are split equally 50/50 and 100% pure when all of the data belongs to the same class.
+
+As we can see in the results below, there are 18 selected variables that are considered relevant. With them we can try again to run our logistic regression and see what we now obtain.
+
+```{r results='hide'}
+
+y<-nhefs_complete$qsmk
+set.seed(111)
+boruta <- Boruta(y ~ ., data = cbind(y, X), doTrace = 2, maxRuns = 100)
+print(boruta)
+
+```
+
+```{r}
+selectedattributes<-getSelectedAttributes(boruta,TRUE)
+selectedattributes
+```
+
+```{r}
+X =subset(nhefs_complete,select = selectedattributes)
+y=nhefs_complete$qsmk
+logpropensity2 <- glm(
+  y ~  ., 
+  family = binomial(), 
+  data = cbind(X,y)
+)
+
+summary(logpropensity2)
+
+```
+
+As it happened with Ridge, none of the selected covariates have significant coefficients in the logistic regression model, which does not help us in understanding the results.
+
+Therefore, taking into consideration all the approaches we have performed for variable or model selection purposes, none of the penalization options nor the random forest approach yielded significant regression coefficients. Therefore, we will stick with the first model, which considered those variables that were indeed relevant for our logistic regression and, as we already saw, they were the ones with non-symmetric distributions in terms of the treatment variable, corresponding to having quit smoking or not over the 10 years that the data collection lasted.
+
+# Propensity Scores by Logistic Regression
+
+Now that we have already studied all the possible approaches that can be considered and we have chosen the naive approach, which yielded the best coefficient results, we will estimate the propensity scores corresponding to our model; i.e., the probability that the patient quit smoking given the covariates of interest we will be considering. In order to do it, we will perform three different approaches: by the logistic regression prediction using the naive approach, by stratification and, finally, by matching.
+
+## Estimating Propensity Scores
+
+The first approach just takes the predictions from the first model we saw. We can see the results that this model yields in the figure below. the plot below shows the distribution of the estimated propensity score
+in quitters (top) and non quitters (bottom). As we can see in the plot, those who quit smoking had, on average, a greater estimated probability of quitting than those who did not quit. the propensity score only balances the measured covariates we estimated in the naive approach to finding the confounders which does not prevent residual confounding by unmeasured variables.
+
+```{r}
+nhefs_complete$ps <- predict(lognaive, type="response")
+summary(nhefs_complete$ps) 
+```
+
+```{r}
+ggplot() +
+  geom_histogram(data = nhefs_complete %>% filter(qsmk == 0),
+                 aes(y = -(..density..), x = ps, fill = qsmk),
+                 col = "black", binwidth = .01) +
+  geom_histogram(data = nhefs_complete %>% filter(qsmk == 1),
+                 aes(y = ..density.., x = ps, fill = qsmk),
+                 col = "black", binwidth = .01) +
+  labs(x = "", y = "Propensity Score") +
+  theme_bw() + theme(legend.position = "right")
+
+```
+
+## Estimating Treatment effects by Stratification
+
+One approach to deal with the continuous propensity score is to create strata that contain individuals with similar, but not identical, values. In our approach we will stratify our data in deciles:
+
+```{r}
+# calculation of deciles
+nhefs_complete$ps.dec <- cut(nhefs_complete$ps, 
+                    breaks=c(quantile(nhefs_complete$ps, probs=seq(0,1,0.1))),
+                    labels=seq(1:10),
+                    include.lowest=TRUE)
+describeBy(nhefs_complete$ps, list(nhefs_complete$ps.dec, nhefs_complete$qsmk))
+```
+
+```{r}
+fit.psdec <- glm(wt82_71 ~ qsmk + as.factor(ps.dec), data = nhefs_complete)
+summary(fit.psdec)
+
+```
+
+```{r}
+stratificationconfint = confint.lm(fit.psdec)
+stratificationconfint%>%kbl() %>% kable_styling()
+```
+
+Finally, after performing stratification over the sample, the effect estimate is between 2.34 and 4.16 with a 95% confidence interval.
+
+## Estimating Treatment effects by matching
+
+Finally, we use the matching technique for estimating treatment effects, the goal of matching will be to construct a subset of the population in which our variables have the same distribution in both the quitters and the actual smokers groups.
+
+```{r}
+nhefs_complete0 <- nhefs_complete[nhefs_complete$qsmk == 0, ]          ## fetch untreated and treated
+nhefs_complete1 <- nhefs_complete[nhefs_complete$qsmk == 1, ]          ## data separately
+match.dat0 <- nhefs_complete1                   ## placeholder for matching untreated
+for (i in 1:nrow(match.dat0)) {      ## for every sought matching untreated
+  tmp <- nhefs_complete0                        ## fetch all untreated
+  tmp$psi <- nhefs_complete1$ps[i]              ## set ps from treated 'i' ind
+  tmp$difps <- abs(tmp$psi - tmp$ps) ## calculate diff
+  tmp <- tmp[order(tmp$difps), ]     ## order untreated
+                                     ## by ps diff w/ 'i' treated
+  tmp <- tmp[, 1:(ncol(tmp)-2)]      ## remove psi and difps columns
+  match.dat0[i, ] <- tmp[1, ]        ## fetch unreated with
+                                     ## smallest ps difference
+}
+match.dat <- rbind(match.dat0, nhefs_complete1)
+dim(match.dat)
+```
+
+```{r}
+matchingdata=lm(wt82_71 ~ qsmk,data= match.dat)
+summary(matchingdata)
+
+```
+
+```{r}
+confintmatching = confint.lm(matchingdata)
+confintmatching%>%kbl() %>% kable_styling()
+```
+
+The final causal effect will be in between 2.073 and 4.34 with a 95% confidence interval.
+
+# Results
+
+```{r}
+ Approach <- c('Regular OLS','Propensity Score Stratification','Propensity Score Matching')
+ Estimate <-c(lmweightgain[["coefficients"]][["qsmk"]],fit.psdec[["coefficients"]][["qsmk"]],matchingdata[["coefficients"]][["qsmk"]])
+ CI2.5 <-c('1.655796','2.354950','2.0730781')
+ CI97.5<-c('3.425367','4.1585117','4.341121')
+ results = data.frame(Approach,CI2.5,CI97.5,Estimate)
+results%>%kbl() %>% kable_styling()
+```
+
+Finally, we put all together and compare the different methods that we have been using for computing the causal effect of gaining weight when you stop smoking cigarettes. Note that our confidence interval values go from 1.65 to 4.34. Also note that both Score Stratification and Score Matching give similar results for the 95% CI and the Estimate. However, the OLS gives values slightly smallers.
+
+As a final conclusion, there are empirical evidences that quit smoking and gaining weight is related, which proofs our initial assumption.
